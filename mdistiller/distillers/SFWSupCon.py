@@ -195,38 +195,26 @@ class MomentumMemoryBank(nn.Module):
         self.register_buffer("queue_logits", torch.zeros(K, num_classes))
 
     @torch.no_grad()
-    def forward(
-        self,
-        features: torch.Tensor,   # [B, dim] — already L2-normalised teacher proj
-        indices: torch.Tensor,    # [B]       — dataset indices
-        labels: torch.Tensor,     # [B]
-        logits: torch.Tensor,     # [B, num_classes] — teacher logits
-        update: bool = True,
-    ) -> torch.Tensor:
-        """Update bank and refresh queue.  Returns sampled bank features [K, dim]."""
-
+    def forward(self, features, indices, labels, logits, update=True):
         if update:
-            features_norm = F.normalize(features.detach(), dim=1)
+            features_norm = F.normalize(features.detach(), dim=1)  # stays on GPU
             old_f = self.memory_features[indices]
             new_f = F.normalize(
                 self.momentum * old_f + (1.0 - self.momentum) * features_norm, dim=1
             )
             self.memory_features[indices] = new_f
             self.memory_labels[indices] = labels
-
             old_l = self.memory_logits[indices]
             self.memory_logits[indices] = (
                 self.momentum * old_l + (1.0 - self.momentum) * logits.detach()
             )
 
-        # Sample K random negatives (with replacement on tiny datasets)
-        sample_idx = torch.randperm(self.n_data, device=features.device)[: self.K]
-        bank_f = self.memory_features[sample_idx]   # [K, dim]
-        bank_l = self.memory_labels[sample_idx]     # [K]
-        bank_lg = self.memory_logits[sample_idx]    # [K, num_classes]
+        sample_idx = torch.randperm(self.n_data, device=self.memory_features.device)[: self.K]
+        bank_f = self.memory_features[sample_idx]
+        bank_l = self.memory_labels[sample_idx]
+        bank_lg = self.memory_logits[sample_idx]
 
-        # Write into queue attributes for loss function consumption
-        self.queue = bank_f.T.contiguous()          # [dim, K]
+        self.queue = bank_f.T.contiguous()
         self.queue_labels = bank_l
         self.queue_logits = bank_lg
 
@@ -442,16 +430,30 @@ class SFWSupCon(Distiller):
         )
 
     def _init_bank(self, n_data: int, device: torch.device):
-        """Lazy initialisation of the memory bank once dataset size is known."""
-        if self._bank_size_cfg > 0 and not self._bank_ready:
+        # """Lazy initialisation of the memory bank once dataset size is known."""
+        # if self._bank_size_cfg > 0 and not self._bank_ready:
+        #     self.memory_bank = MomentumMemoryBank(
+        #         n_data=n_data,
+        #         dim=self.proj_dim,
+        #         K=self._bank_size_cfg,
+        #         momentum=self.bank_momentum,
+        #         num_classes=self.student.fc.out_features,  # CIFAR-100 → 100
+        #     ).to(device)
+        #     self._bank_ready = True
+        if self._bank_ready:          # ← already initialized, skip
+            return
+        if self.bank_size > 0:
             self.memory_bank = MomentumMemoryBank(
-                n_data=n_data,
+                n_data=50_000,
                 dim=self.proj_dim,
-                K=self._bank_size_cfg,
+                K=self.bank_size,
                 momentum=self.bank_momentum,
-                num_classes=self.student.fc.out_features,  # CIFAR-100 → 100
+                num_classes=self.student.fc.out_features,
             ).to(device)
             self._bank_ready = True
+        else:
+            self.memory_bank = None
+            self._bank_ready = False
 
     def get_learnable_parameters(self):
         """

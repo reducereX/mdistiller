@@ -79,7 +79,14 @@ class BaseTrainer(object):
         if resume:
             state = load_checkpoint(os.path.join(self.log_path, "latest"))
             epoch = state["epoch"] + 1
-            self.distiller.load_state_dict(state["model"])
+            # self.distiller.load_state_dict(state["model"])
+            
+            missing, unexpected = self.distiller.load_state_dict(state["model"], strict=False)
+            if unexpected:
+                print(f"[RESUME] Ignored unexpected keys: {unexpected}")
+            if missing:
+                print(f"[RESUME] Missing keys (will use fresh init): {missing}")
+                
             self.optimizer.load_state_dict(state["optimizer"])
             self.best_acc = state["best_acc"]
         while epoch < self.cfg.SOLVER.EPOCHS + 1:

@@ -3,13 +3,13 @@ EXPERIMENT:
   TAG:  "cifar100"
 
 DATASET:
-  TYPE: cifar100
+  TYPE: "cifar100"
   NUM_WORKERS: 0
 
 DISTILLER:
-  TYPE: SFWSupCon
-  TEACHER: resnet32x4
-  STUDENT: resnet8x4
+  TYPE: "SFWSupCon"
+  TEACHER: "resnet32x4"
+  STUDENT: "resnet8x4"
 
 SFWSupCon:
   alpha:         1.0
@@ -23,8 +23,8 @@ SFWSupCon:
   kd_weight:     1.0
 
 SOLVER:
-  TYPE: SGD
-  TRAINER: SFWSupCon
+  TYPE: "SGD"
+  TRAINER: "SFWSupCon"
   LR: 0.05
   LR_DECAY_STAGES: [150, 180, 210]
   LR_DECAY_RATE: 0.1
