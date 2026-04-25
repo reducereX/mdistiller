@@ -91,6 +91,29 @@ class BaseTrainer(object):
 
     def train_epoch(self, epoch):
         lr = adjust_learning_rate(epoch, self.cfg, self.optimizer)
+        
+        # ----- LR verification (every decay stage + epoch 1) -----
+        decay_stages = self.cfg.SOLVER.LR_DECAY_STAGES
+        if epoch == 1 or epoch in decay_stages or (epoch - 1) in decay_stages:
+            base_lr = self.cfg.SOLVER.LR
+            print(f"\n[LR CHECK] Epoch {epoch}")
+            expected = {
+                "student":          base_lr,
+                "teacher_projector": base_lr * 0.1,
+                "student_projector": base_lr,
+            }
+            steps = sum(epoch > s for s in decay_stages)
+            decay = self.cfg.SOLVER.LR_DECAY_RATE ** steps
+            for name, init_lr in expected.items():
+                expected[name] = init_lr * decay
+
+            for i, pg in enumerate(self.optimizer.param_groups):
+                names = ["student", "teacher_projector", "student_projector"]
+                actual = pg["lr"]
+                exp = expected[names[i]]
+                status = "OK" if abs(actual - exp) < 1e-8 else "MISMATCH"
+                print(f"  [{status}] {names[i]}: actual={actual:.6f} | expected={exp:.6f}")
+                
         train_meters = {
             "training_time": AverageMeter(),
             "data_time": AverageMeter(),
@@ -363,6 +386,75 @@ class CRDDOT(BaseTrainer):
         train_meters["top1"].update(acc1[0], batch_size)
         train_meters["top5"].update(acc5[0], batch_size)
         # print info
+        msg = "Epoch:{}| Time(data):{:.3f}| Time(train):{:.3f}| Loss:{:.4f}| Top-1:{:.3f}| Top-5:{:.3f}".format(
+            epoch,
+            train_meters["data_time"].avg,
+            train_meters["training_time"].avg,
+            train_meters["losses"].avg,
+            train_meters["top1"].avg,
+            train_meters["top5"].avg,
+        )
+        return msg
+    
+class SFWSupConTrainer(BaseTrainer):
+
+    def init_optimizer(self, cfg):
+        base_lr = cfg.SOLVER.LR
+        optimizer = optim.SGD(
+            [
+                {
+                    "params":     list(self.distiller.module.student.parameters()),
+                    "lr":         base_lr,
+                    "initial_lr": base_lr,
+                },
+                {
+                    # teacher projector — joint training at LR/10
+                    "params":     list(self.distiller.module.teacher_projector.parameters()),
+                    "lr":         base_lr * 0.1,
+                    "initial_lr": base_lr * 0.1,
+                },
+                {
+                    "params":     list(self.distiller.module.student_projector.parameters()),
+                    "lr":         base_lr,
+                    "initial_lr": base_lr,
+                },
+            ],
+            momentum=cfg.SOLVER.MOMENTUM,
+            weight_decay=cfg.SOLVER.WEIGHT_DECAY,
+        )
+        return optimizer
+
+    def train_iter(self, data, epoch, train_meters):
+        self.optimizer.zero_grad()
+        train_start_time = time.time()
+        image, target, index = data
+        train_meters["data_time"].update(time.time() - train_start_time)
+
+        # image is a (view1, view2) tuple when two-view transform is active
+        if isinstance(image, (tuple, list)):
+            image = [v.float().cuda(non_blocking=True) for v in image]
+        else:
+            image = image.float().cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        index  = index.cuda(non_blocking=True)
+
+        preds, losses_dict = self.distiller(
+            image=image,
+            target=target,
+            index=index,
+            epoch=epoch,
+        )
+
+        loss = sum([l.mean() for l in losses_dict.values()])
+        loss.backward()
+        self.optimizer.step()
+
+        train_meters["training_time"].update(time.time() - train_start_time)
+        batch_size = image[0].size(0) if isinstance(image, (tuple, list)) else image.size(0)
+        acc1, acc5 = accuracy(preds, target, topk=(1, 5))
+        train_meters["losses"].update(loss.cpu().detach().numpy().mean(), batch_size)
+        train_meters["top1"].update(acc1[0], batch_size)
+        train_meters["top5"].update(acc5[0], batch_size)
         msg = "Epoch:{}| Time(data):{:.3f}| Time(train):{:.3f}| Loss:{:.4f}| Top-1:{:.3f}| Top-5:{:.3f}".format(
             epoch,
             train_meters["data_time"].avg,

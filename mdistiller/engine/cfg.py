@@ -170,3 +170,15 @@ CFG.DKD.WARMUP = 20
 # DOT CFG
 CFG.SOLVER.DOT = CN()
 CFG.SOLVER.DOT.DELTA = 0.075
+
+# SFWSupCon CFG
+CFG.SFWSupCon = CN()
+CFG.SFWSupCon.alpha = 1.0
+CFG.SFWSupCon.beta = 10.0
+CFG.SFWSupCon.temperature = 0.07
+CFG.SFWSupCon.proj_dim = 64
+CFG.SFWSupCon.bank_size = 4096
+CFG.SFWSupCon.bank_momentum = 0.5
+CFG.SFWSupCon.adaptive_beta = True
+CFG.SFWSupCon.ce_weight = 1.0
+CFG.SFWSupCon.kd_weight = 1.0
