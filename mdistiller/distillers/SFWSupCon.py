@@ -303,7 +303,13 @@ def _sfwsupcon_loss_with_bank(
 
     # ---- numerator & in-batch denominator -----------------------------------
     sum_pos_exp = (exp_batch * mask_pos).sum(dim=1)           # [B]
-    numerator_term = w_pull * sum_pos_exp                     # [B]
+    
+    # guaranteed instance-matched positive: student_i · teacher_i (diagonal)
+    # this eliminates degenerate anchors when no same-class pairs exist in batch
+    diag_exp = torch.diagonal(exp_batch)                      # [B]
+    numerator_term = w_pull * (sum_pos_exp + diag_exp)        # [B]
+    
+    # numerator_term = w_pull * sum_pos_exp                     # [B]
     weighted_neg_exp = (exp_batch * w_push * mask_neg).sum(dim=1)  # [B]
     denominator_term = numerator_term + weighted_neg_exp      # [B]
 
@@ -339,6 +345,35 @@ def _sfwsupcon_loss_with_bank(
     loss = -torch.log((numerator_term + eps) / (denominator_term + eps))
     return (loss / alpha).mean()
 
+def _supcon_pretrain_loss(t_proj, labels, tau=0.07):
+    """
+    Standard supervised contrastive loss applied to teacher projections only.
+    Used to pretrain the teacher projector so it has meaningful semantic
+    structure before the bank starts being populated and the student starts
+    distilling from it.
+    """
+    t_norm = F.normalize(t_proj, dim=1)
+    sim = torch.matmul(t_norm, t_norm.T) / tau   # [2B, 2B]
+
+    # numerical stability
+    sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+    sim = sim - sim_max.detach()
+
+    labels_col = labels.view(-1, 1)
+    mask_pos = torch.eq(labels_col, labels_col.T).float()
+    # exclude self from positives (every other same-class sample IS a positive)
+    mask_pos.fill_diagonal_(0.0)
+    # mask out self from denominator too
+    mask_self = 1.0 - torch.eye(sim.shape[0], device=sim.device)
+
+    exp_sim = torch.exp(sim) * mask_self
+    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+    # mean log-prob over positives per anchor
+    pos_count = mask_pos.sum(dim=1).clamp(min=1.0)
+    loss = -(mask_pos * log_prob).sum(dim=1) / pos_count
+
+    return loss.mean()
 
 # ---------------------------------------------------------------------------
 # Main Distiller class
@@ -521,48 +556,62 @@ class SFWSupCon(Distiller):
         # ----- teacher forward (backbone frozen) ----------------------------
         with torch.no_grad():
             t_logits, t_feats = self.teacher(images_dual)
-            t_feat = t_feats["pooled_feat"]   # [2B, t_dim]
+            t_feat = t_feats["pooled_feat"]
 
-        # teacher projection (trainable, outside no_grad)
-        t_proj = self.teacher_projector(t_feat.detach())   # [2B, proj_dim]
+        t_proj = self.teacher_projector(t_feat.detach())
 
         # ----- student forward ----------------------------------------------
         s_logits, s_feats = self.student(images_dual)
-        s_feat = s_feats["pooled_feat"]                    # [2B, s_dim]
-        # Detach: CE loss trains backbone independently, contrastive only updates projector
-        s_proj = self.student_projector(s_feat.detach())   # [2B, proj_dim]
+        s_feat = s_feats["pooled_feat"]
+        s_proj = self.student_projector(s_feat)
 
         # ----- memory bank init + update ------------------------------------
         self._init_bank(50_000, device)
-        if self.memory_bank is not None:
-            self.memory_bank(t_proj, indices_dual, labels_dual, t_logits, update=True)
-        # ----- Memory bank verification (epoch 1 only) -----
-        if epoch == 1 and not getattr(self, "_bank_verified", False):
-            if self.memory_bank is not None:
-                print(f"\n[BANK] Memory bank ACTIVE")
-                print(f"  Full dataset size : {self.memory_bank.n_data}")
-                print(f"  Negatives per step: {self.memory_bank.K}")
-                print(f"  Feature dim       : {self.memory_bank.dim}")
-                print(f"  EMA momentum      : {self.memory_bank.momentum}")
-                print(f"  memory_features   : {self.memory_bank.memory_features.shape}")
-            else:
-                print(f"\n[BANK] Memory bank DISABLED (bank_size=0)")
-            self._bank_verified = True
-        # ----- contrastive loss ---------------------------------------------
-        kd_loss = _sfwsupcon_loss_with_bank(
-            student_proj=s_proj,
-            teacher_proj=t_proj,
-            teacher_logits=t_logits,
-            labels=labels_dual,
-            memory_bank=self.memory_bank,
-            alpha=self.alpha,
-            beta=self.beta,
-            tau=self.tau,
-            adaptive_beta=self.adaptive_beta,
-        )
 
-        # ----- CE loss on view-1 only ---------------------------------------
-        s_logits_v1 = s_logits[:view1.shape[0]]   # [B, C]
+        # ============================================================
+        # PHASE 1: Teacher projector pretraining (epochs 1..TP_PRETRAIN)
+        # ============================================================
+        TP_PRETRAIN_EPOCHS = 30  # tune this; notebook used ~10 with cosine probe
+
+        if epoch is not None and epoch <= TP_PRETRAIN_EPOCHS:
+            # Train teacher_projector with supervised contrastive loss on t_proj alone.
+            # NO bank used yet (bank is still random — would just inject noise).
+            # NO student contrastive — just CE on student.
+            kd_loss = _supcon_pretrain_loss(t_proj, labels_dual, tau=self.tau)
+
+            # Don't update bank during pretraining — wait until projector is good
+            # (otherwise bank fills up with mid-pretraining garbage)
+
+            if epoch == 1 and not getattr(self, "_pretrain_announced", False):
+                print(f"\n[PRETRAIN] Teacher projector pretraining for {TP_PRETRAIN_EPOCHS} epochs")
+                self._pretrain_announced = True
+
+        # ============================================================
+        # PHASE 2: Full SFW-SupCon distillation (epoch > TP_PRETRAIN)
+        # ============================================================
+        else:
+            # Now bank starts updating — projector is competent, entries are meaningful
+            if self.memory_bank is not None:
+                self.memory_bank(t_proj, indices_dual, labels_dual, t_logits, update=True)
+
+            if epoch == TP_PRETRAIN_EPOCHS + 1 and not getattr(self, "_phase2_announced", False):
+                print(f"\n[PHASE 2] Switching to full SFW-SupCon distillation with bank")
+                self._phase2_announced = True
+
+            kd_loss = _sfwsupcon_loss_with_bank(
+                student_proj=s_proj,
+                teacher_proj=t_proj,
+                teacher_logits=t_logits,
+                labels=labels_dual,
+                memory_bank=self.memory_bank,
+                alpha=self.alpha,
+                beta=self.beta,
+                tau=self.tau,
+                adaptive_beta=self.adaptive_beta,
+            )
+
+        # ----- CE loss on view-1 only (always active) -----------------------
+        s_logits_v1 = self.student.fc(s_feat[:view1.shape[0]].detach())
         ce_loss = self.ce_loss_fn(s_logits_v1, target)
 
         losses_dict = {
@@ -570,7 +619,6 @@ class SFWSupCon(Distiller):
             "loss_kd": kd_loss,
         }
         return s_logits_v1, losses_dict
-
 
 # ---------------------------------------------------------------------------
 # Dataset wrapper — required for index-based memory bank

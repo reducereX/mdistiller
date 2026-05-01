@@ -4,12 +4,16 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from PIL import Image
 
+
 class TwoViewTransform:
     """Applies transform twice independently to produce two augmented views."""
+
     def __init__(self, t):
         self.t = t
+
     def __call__(self, x):
         return self.t(x), self.t(x)
+
 
 def get_data_folder():
     data_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../data")
@@ -200,30 +204,40 @@ def get_cifar100_dataloaders_sample(
     )
     return train_loader, test_loader, num_data
 
+
 def get_cifar100_dataloaders_sfwsupcon(batch_size, val_batch_size, num_workers):
     data_folder = get_data_folder()
 
-    augment = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
+    augment = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ]
+    )
 
     test_transform = get_cifar100_test_transform()
 
     train_set = CIFAR100Instance(
-        root=data_folder, download=True, train=True,
-        transform=TwoViewTransform(augment)  # now references module-level class
+        root=data_folder,
+        download=True,
+        train=True,
+        transform=TwoViewTransform(augment),  # now references module-level class
     )
     num_data = len(train_set)
     test_set = datasets.CIFAR100(
         root=data_folder, download=True, train=False, transform=test_transform
     )
     train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=True
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,
     )
     test_loader = DataLoader(
         test_set, batch_size=val_batch_size, shuffle=False, num_workers=0
