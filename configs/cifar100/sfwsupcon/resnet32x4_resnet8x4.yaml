@@ -21,6 +21,8 @@ SFWSupCon:
   adaptive_beta: true
   ce_weight:     1.0
   kd_weight:     1.0
+  aux_weight:    0.5
+  kd_warmup_epochs:  10
 
 SOLVER:
   TYPE: "SGD"
@@ -32,3 +34,4 @@ SOLVER:
   MOMENTUM: 0.9
   EPOCHS: 240
   BATCH_SIZE: 128
+  

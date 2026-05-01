@@ -424,6 +424,8 @@ class SFWSupCon(Distiller):
         self.adaptive_beta = getattr(sfw_cfg, "adaptive_beta", True)
         self.ce_weight = getattr(sfw_cfg, "ce_weight", 1.0)
         self.kd_weight = getattr(sfw_cfg, "kd_weight", 1.0)
+        self.aux_weight = getattr(sfw_cfg, "aux_weight", 0.5)
+        self.kd_warmup_epochs = getattr(sfw_cfg, "kd_warmup_epochs", 10)
 
         # ---- infer feature dimensions ---------------------------------------
         # mdistiller models expose get_stage_channels(); last entry = penultimate dim
@@ -444,6 +446,7 @@ class SFWSupCon(Distiller):
 
         # ---- CE criterion ---------------------------------------------------
         self.ce_loss_fn = nn.CrossEntropyLoss()
+        
 
     # ------------------------------------------------------------------
     # Helpers
@@ -542,62 +545,36 @@ class SFWSupCon(Distiller):
     # ------------------------------------------------------------------
 
     def forward_train(self, image, target, index, epoch=None, **kwargs):
-        # ----- unpack two-view or single-view input -------------------------
-        if isinstance(image, (list, tuple)):
-            view1, view2 = image[0], image[1]
-        else:
-            view1 = view2 = image
+            # ----- unpack two-view or single-view input -------------------------
+            if isinstance(image, (list, tuple)):
+                view1, view2 = image[0], image[1]
+            else:
+                view1 = view2 = image
 
-        device = view1.device
-        images_dual = torch.cat([view1, view2], dim=0)
-        labels_dual = torch.cat([target, target], dim=0)
-        indices_dual = torch.cat([index, index], dim=0)
+            device = view1.device
+            images_dual = torch.cat([view1, view2], dim=0)
+            labels_dual = torch.cat([target, target], dim=0)
+            indices_dual = torch.cat([index, index], dim=0)
 
-        # ----- teacher forward (backbone frozen) ----------------------------
-        with torch.no_grad():
-            t_logits, t_feats = self.teacher(images_dual)
-            t_feat = t_feats["pooled_feat"]
+            # ----- teacher forward (backbone frozen) ----------------------------
+            with torch.no_grad():
+                t_logits, t_feats = self.teacher(images_dual)
+                t_feat = t_feats["pooled_feat"]
 
-        t_proj = self.teacher_projector(t_feat.detach())
+            # t_feat is detached; gradient into teacher_projector only
+            t_proj = self.teacher_projector(t_feat.detach())
 
-        # ----- student forward ----------------------------------------------
-        s_logits, s_feats = self.student(images_dual)
-        s_feat = s_feats["pooled_feat"]
-        s_proj = self.student_projector(s_feat)
+            # ----- student forward ----------------------------------------------
+            s_logits, s_feats = self.student(images_dual)
+            s_feat = s_feats["pooled_feat"]
+            s_proj = self.student_projector(s_feat)
 
-        # ----- memory bank init + update ------------------------------------
-        self._init_bank(50_000, device)
-
-        # ============================================================
-        # PHASE 1: Teacher projector pretraining (epochs 1..TP_PRETRAIN)
-        # ============================================================
-        TP_PRETRAIN_EPOCHS = 30  # tune this; notebook used ~10 with cosine probe
-
-        if epoch is not None and epoch <= TP_PRETRAIN_EPOCHS:
-            # Train teacher_projector with supervised contrastive loss on t_proj alone.
-            # NO bank used yet (bank is still random — would just inject noise).
-            # NO student contrastive — just CE on student.
-            kd_loss = _supcon_pretrain_loss(t_proj, labels_dual, tau=self.tau)
-
-            # Don't update bank during pretraining — wait until projector is good
-            # (otherwise bank fills up with mid-pretraining garbage)
-
-            if epoch == 1 and not getattr(self, "_pretrain_announced", False):
-                print(f"\n[PRETRAIN] Teacher projector pretraining for {TP_PRETRAIN_EPOCHS} epochs")
-                self._pretrain_announced = True
-
-        # ============================================================
-        # PHASE 2: Full SFW-SupCon distillation (epoch > TP_PRETRAIN)
-        # ============================================================
-        else:
-            # Now bank starts updating — projector is competent, entries are meaningful
+            # ----- memory bank init + update ------------------------------------
+            self._init_bank(50_000, device)
             if self.memory_bank is not None:
                 self.memory_bank(t_proj, indices_dual, labels_dual, t_logits, update=True)
 
-            if epoch == TP_PRETRAIN_EPOCHS + 1 and not getattr(self, "_phase2_announced", False):
-                print(f"\n[PHASE 2] Switching to full SFW-SupCon distillation with bank")
-                self._phase2_announced = True
-
+            # ----- contrastive distillation loss --------------------------------
             kd_loss = _sfwsupcon_loss_with_bank(
                 student_proj=s_proj,
                 teacher_proj=t_proj,
@@ -610,15 +587,44 @@ class SFWSupCon(Distiller):
                 adaptive_beta=self.adaptive_beta,
             )
 
-        # ----- CE loss on view-1 only (always active) -----------------------
-        s_logits_v1 = self.student.fc(s_feat[:view1.shape[0]].detach())
-        ce_loss = self.ce_loss_fn(s_logits_v1, target)
+            # ----- auxiliary supervised-contrastive on teacher projections -----
+            # Trains teacher_projector independently of student/bank dynamics.
+            # Replaces the cosine-probe pretraining from the original notebook.
+            # Cannot flow into teacher backbone (t_feat already detached above).
+            aux_t_loss = _supcon_pretrain_loss(t_proj, labels_dual, tau=self.tau)
 
-        losses_dict = {
-            "loss_ce": ce_loss,
-            "loss_kd": kd_loss,
-        }
-        return s_logits_v1, losses_dict
+            # ----- CE loss on both views (no detach — encoder gets the signal) -
+            target_dual = torch.cat([target, target], dim=0)
+            ce_loss = self.ce_loss_fn(s_logits, target_dual)
+
+            # ----- kd warmup: ramp 0 -> 1 over first `kd_warmup_epochs` epochs --
+            # Lets the projector learn class structure from aux_t_loss before the
+            # student starts distilling against it. Avoids the bootstrap stall.
+            if epoch is not None and self.kd_warmup_epochs > 0:
+                kd_scale = min(1.0, max(epoch - 1, 0) / float(self.kd_warmup_epochs))
+            else:
+                kd_scale = 1.0
+
+            losses_dict = {
+                "loss_ce":  self.ce_weight  * ce_loss,
+                "loss_kd":  self.kd_weight  * kd_scale * kd_loss,
+                "loss_aux": self.aux_weight * aux_t_loss,
+            }
+
+            # ----- per-100-step logging (drop once you're done debugging) ------
+            if not hasattr(self, "_step"):
+                self._step = 0
+            self._step += 1
+            if self._step % 100 == 0:
+                print(
+                    f"  loss_ce={ce_loss.item():.4f}  "
+                    f"loss_kd={kd_loss.item():.4f} (scale={kd_scale:.2f})  "
+                    f"loss_aux={aux_t_loss.item():.4f}"
+                )
+
+            # Return view-1 logits for the accuracy meter
+            return s_logits[: view1.shape[0]], losses_dict
+
 
 # ---------------------------------------------------------------------------
 # Dataset wrapper — required for index-based memory bank

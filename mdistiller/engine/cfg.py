@@ -182,3 +182,5 @@ CFG.SFWSupCon.bank_momentum = 0.5
 CFG.SFWSupCon.adaptive_beta = True
 CFG.SFWSupCon.ce_weight = 1.0
 CFG.SFWSupCon.kd_weight = 1.0
+CFG.SFWSupCon.aux_weight = 0.5
+CFG.SFWSupCon.kd_warmup_epochs = 10
